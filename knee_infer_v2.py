@@ -1,6 +1,6 @@
 # V2 inference: multi-architecture ensemble with 4-way TTA
 # Supports both v1 (Net) and v2 (NetV2) model checkpoints auto-detected from keys.
-import os, time, glob, numpy as np, pandas as pd, pydicom, cv2, torch, torch.nn as nn, torch.nn.functional as F, timm
+import os, re, time, glob, numpy as np, pandas as pd, pydicom, cv2, torch, torch.nn as nn, torch.nn.functional as F, timm
 from multiprocessing import Pool
 
 D = '/kaggle/input/competitions/rsna-knee-abnormality-detection'
@@ -9,6 +9,9 @@ ts = pd.read_csv(f'{D}/{SPLIT}_series.csv')
 st = pd.read_csv(f'{D}/{SPLIT}.csv')
 L = ['ACL','MCL','Medial Meniscus','Lateral Meniscus','Medial OA','Lateral OA',
      'PF OA','Effusion','Synovitis',"Baker's",'Contusion','Fracture']
+
+AMP_DTYPE = torch.bfloat16 if os.environ.get('AMP', 'fp16') == 'bf16' else torch.float16
+ENSEMBLE = os.environ.get('ENSEMBLE', 'mean')   # 'mean' of probabilities or 'rank' average (AUC-friendly)
 
 # ── preprocessing (identical to v1) ───────────────────────────────────────────
 def pick(g):
@@ -78,7 +81,7 @@ class NetV2(nn.Module):
         s.aux = nn.ModuleList([nn.Linear(c, 12) for _ in range(3)])
 
     def forward(s, x, return_aux=False):
-      with torch.autocast('cuda', dtype=torch.float16):
+      with torch.autocast('cuda', dtype=AMP_DTYPE):
         B, P, N, H, W = x.shape
         x = x.float() / 255.0
         pad = torch.cat([x[:,:,:1], x, x[:,:,-1:]], 2)
@@ -87,8 +90,8 @@ class NetV2(nn.Module):
         f = s.enc(trip.reshape(B*P*N, 3, H, W)).reshape(B, P, N, s.c)
         pos = s.pos_emb
         if N != s.ns:
-            pos = F.interpolate(pos.permute(0,1,3,2), size=N, mode='linear',
-                                align_corners=False).permute(0,1,3,2)
+            pos = F.interpolate(pos[0].transpose(1, 2), size=N, mode='linear',
+                                align_corners=False).transpose(1, 2)[None]
         f = f + pos + s.plane_emb[None,:,None,:]
         h = s.att_v(f) * s.att_u(f)
         a = torch.softmax(s.att_w(h).squeeze(-1), -1)
@@ -112,7 +115,7 @@ class Net(nn.Module):
         s.head = nn.Sequential(nn.Dropout(0.3), nn.Linear(3*c, 512), nn.GELU(),
                                nn.Dropout(0.2), nn.Linear(512, 12))
     def forward(s, x):
-      with torch.autocast('cuda', dtype=torch.float16):
+      with torch.autocast('cuda', dtype=AMP_DTYPE):
         B, P, N, H, W = x.shape; x = x.float() / 255.
         pad = torch.cat([x[:,:,:1], x, x[:,:,-1:]], 2)
         trip = torch.stack([pad[:,:,:-2], pad[:,:,1:-1], pad[:,:,2:]], 3)
@@ -133,7 +136,21 @@ ARCH_MAP = {
     'convnext_small':  'convnext_small.in12k_ft_in1k',
     'convnextv2_tiny': 'convnextv2_tiny.fcmae_ft_in22k_in1k',
     'efficientnetv2_s':'tf_efficientnetv2_s.in21k_ft_in1k',
+    # short aliases for DINOv3 backbones; v2 training now writes the full name (dots -> '-')
+    'vit_small_patch16_dinov3': 'vit_small_patch16_dinov3.lvd1689m',
+    'vit_base_patch16_dinov3':  'vit_base_patch16_dinov3.lvd1689m',
+    'vit_large_patch16_dinov3': 'vit_large_patch16_dinov3.lvd1689m',
 }
+
+def arch_of(basename):
+    """model_<arch>_f<fold>_s<seed>[_swa][_full].pt -> timm arch name."""
+    m = re.match(r'model_(.+?)_f\d+_s\d+', basename)
+    key = m.group(1) if m else basename[len('model_'):].split('_f')[0]
+    return ARCH_MAP.get(key, key.replace('-', '.'))
+
+def rank01(p):
+    """Per-column rank transform to (0, 1]."""
+    return (np.argsort(np.argsort(p, 0), 0) + 1) / len(p)
 
 if __name__ == '__main__':
     t0 = time.time()
@@ -158,8 +175,7 @@ if __name__ == '__main__':
 
     for pth in paths:
         bn = os.path.basename(pth)
-        arch_key = bn.replace('model_', '').split('_f')[0]
-        arch = ARCH_MAP.get(arch_key, arch_key)
+        arch = arch_of(bn)
 
         # detect model version from checkpoint keys
         ckpt = torch.load(pth, map_location='cpu', weights_only=False)
@@ -168,25 +184,31 @@ if __name__ == '__main__':
 
         try:
             if is_v2:
-                m = NetV2(arch, ns=NS, pre=False)
+                m = NetV2(arch, ns=sd['pos_emb'].shape[2] if 'pos_emb' in sd else NS, pre=False)
             else:
                 m = Net(arch, pre=False)
-            m.load_state_dict(sd, strict=False)
+            missing, unexpected = m.load_state_dict(sd, strict=False)
+            if missing or unexpected:
+                print(f'WARN {bn}: missing {len(missing)} {missing[:3]} unexpected {len(unexpected)} {unexpected[:3]}', flush=True)
+            if len(missing) > 0.5 * len(m.state_dict()):
+                raise RuntimeError('checkpoint does not match architecture')
         except Exception as e:
             print(f'SKIP {bn}: {e}', flush=True); continue
 
         m = m.cuda().eval()
         dp_m = nn.DataParallel(m) if torch.cuda.device_count() > 1 else m
 
+        Pm = np.zeros((len(uids), 12), np.float64)
         with torch.no_grad():
             for b in range(0, len(uids), 8):
                 xb = torch.from_numpy(X[b:b+8]).cuda()
-                with torch.autocast('cuda', dtype=torch.float16):
+                with torch.autocast('cuda', dtype=AMP_DTYPE):
                     p  = torch.sigmoid(dp_m(xb).float())
                     p += torch.sigmoid(dp_m(xb.flip(-1)).float())           # h-flip
                     p += torch.sigmoid(dp_m(xb.flip(2)).float())            # slice-reverse
                     p += torch.sigmoid(dp_m(xb.flip(-1).flip(2)).float())   # both
-                P[b:b+8] += (p / 4).cpu().numpy()
+                Pm[b:b+8] = (p / 4).cpu().numpy()
+        P += rank01(Pm) if ENSEMBLE == 'rank' and len(uids) > 1 else Pm
         nm += 1
         print(f'model {nm}: {bn} ({arch}) v{"2" if is_v2 else "1"}  {time.time()-t0:.0f}s', flush=True)
         del m, dp_m; torch.cuda.empty_cache()

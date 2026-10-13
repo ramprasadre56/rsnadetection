@@ -6,6 +6,10 @@
 #   ARCH=convnextv2_nano.fcmae_ft_in22k_in1k FOLD=0 python knee_train_v2.py
 #   ARCH=efficientnet_b3.ra2_in1k            FOLD=1 python knee_train_v2.py
 #   ARCH=resnet34d.ra2_in1k                  FOLD=2 FULL=1 python knee_train_v2.py
+#   DINOv3 backbones (self-supervised, LVD-1689M; ungated timm weights):
+#   ARCH=vit_small_patch16_dinov3.lvd1689m LR=1e-4 LAYER_DECAY=0.8 FOLD=0 python knee_train_v2.py
+#   ARCH=vit_base_patch16_dinov3.lvd1689m  LR=8e-5 LAYER_DECAY=0.8 BS=4 ACCUM=3 FOLD=1 python knee_train_v2.py
+#   ARCH=convnext_tiny.dinov3_lvd1689m     LR=1.5e-4 LAYER_DECAY=0.85 FOLD=2 python knee_train_v2.py
 import os, glob, time, math, numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F, timm
 from copy import deepcopy
 from sklearn.metrics import roc_auc_score
@@ -40,8 +44,18 @@ CFG = dict(
     ema     = float(os.environ.get('EMA_DECAY', '0.998')),
     accum   = int(os.environ.get('ACCUM', '2')),
     swa_pct = float(os.environ.get('SWA_PCT', '0.75')),
+    # layer-wise lr decay for the encoder (1.0 = off); defaults to 0.8 for DINOv3 backbones
+    layer_decay = float(os.environ.get('LAYER_DECAY', '0')),
+    grad_ckpt   = int(os.environ.get('GRAD_CKPT', '-1')),   # -1 = auto (on for ViTs)
+    amp         = os.environ.get('AMP', 'fp16'),            # fp16 (T4/P100) or bf16 (A100/H100)
 )
+IS_DINOV3 = 'dinov3' in CFG['arch']
+IS_VIT = CFG['arch'].startswith(('vit_', 'eva', 'deit', 'beit'))
+if CFG['layer_decay'] <= 0: CFG['layer_decay'] = 0.8 if IS_DINOV3 else 1.0
+if CFG['grad_ckpt'] < 0:   CFG['grad_ckpt'] = int(IS_VIT)
+AMP_DTYPE = torch.bfloat16 if CFG['amp'] == 'bf16' else torch.float16
 print(CFG, flush=True)
+ARCH_TAG = CFG['arch'].replace('.', '-')
 t0 = time.time()
 
 # ── data ──────────────────────────────────────────────────────────────────────
@@ -137,7 +151,7 @@ class NetV2(nn.Module):
         s.aux = nn.ModuleList([nn.Linear(c, 12) for _ in range(3)])
 
     def forward(s, x, return_aux=False):
-      with torch.autocast('cuda', dtype=torch.float16):
+      with torch.autocast('cuda', dtype=AMP_DTYPE):
         B, P, N, H, W = x.shape
         x = x.float() / 255.0
         # 2.5-D triplets (prev, cur, next)
@@ -148,8 +162,8 @@ class NetV2(nn.Module):
         # positional + plane embeddings (interpolate if NS differs)
         pos = s.pos_emb
         if N != s.ns:
-            pos = F.interpolate(pos.permute(0,1,3,2), size=N, mode='linear',
-                                align_corners=False).permute(0,1,3,2)
+            pos = F.interpolate(pos[0].transpose(1, 2), size=N, mode='linear',
+                                align_corners=False).transpose(1, 2)[None]
         f = f + pos + s.plane_emb[None,:,None,:]
         # gated attention pooling over slices
         h = s.att_v(f) * s.att_u(f)
@@ -205,18 +219,41 @@ def augment(x):
 
 # ── build ─────────────────────────────────────────────────────────────────────
 model = NetV2(CFG['arch'], ns=NS).cuda()
+if CFG['grad_ckpt']: model.enc.set_grad_checkpointing(True)
 dp    = nn.DataParallel(model)
 ema   = EMA(model, CFG['ema'])
 
-bb = [p for n, p in model.named_parameters() if 'enc' in n]
-hd = [p for n, p in model.named_parameters() if 'enc' not in n]
-opt   = torch.optim.AdamW([{'params': bb, 'lr': CFG['lr']},
-                            {'params': hd, 'lr': CFG['lr'] * 3}],
-                           weight_decay=CFG['wd'])
+def enc_depth(name, n_layers):
+    """Layer id of an encoder param: 0 = stem/patch-embed, n_layers+1 = final norm."""
+    parts = name.split('.')
+    if parts[0] in ('blocks', 'stages') and len(parts) > 1 and parts[1].isdigit():
+        return int(parts[1]) + 1
+    if parts[0] in ('norm', 'fc_norm', 'head', 'head_norm', 'norm_pre'):
+        return n_layers + 1
+    return 0
+
+def param_groups(model, lr, wd, decay):
+    enc = model.enc
+    n_layers = len(enc.blocks) if hasattr(enc, 'blocks') else len(getattr(enc, 'stages', [])) or 1
+    groups = {}
+    for n, p in model.named_parameters():
+        if not p.requires_grad: continue
+        no_wd = p.ndim <= 1 or 'token' in n or n in ('plane_emb', 'pos_emb')
+        if n.startswith('enc.'):
+            lid = enc_depth(n[4:], n_layers)
+            scale = decay ** (n_layers + 1 - lid)
+            key = f'enc{lid}_{int(no_wd)}'
+        else:
+            scale = 3.0; key = f'head_{int(no_wd)}'   # randomly initialised head learns faster
+        g = groups.setdefault(key, {'params': [], 'lr': lr * scale, 'weight_decay': 0.0 if no_wd else wd})
+        g['params'].append(p)
+    return list(groups.values())
+
+opt   = torch.optim.AdamW(param_groups(model, CFG['lr'], CFG['wd'], CFG['layer_decay']))
 total_steps = CFG['epochs'] * (len(trn) // (CFG['bs'] * CFG['accum']))
 sched = torch.optim.lr_scheduler.LambdaLR(
     opt, lambda s: min(1, (s+1)/300) * 0.5 * (1 + math.cos(math.pi * min(1, s / max(total_steps, 1)))))
-scaler = torch.amp.GradScaler()
+scaler = torch.amp.GradScaler(enabled=AMP_DTYPE == torch.float16)
 
 swa_model = None; swa_n = 0; swa_ep = int(CFG['epochs'] * CFG['swa_pct'])
 
@@ -230,7 +267,7 @@ def batches(ids, bs, shuffle):
 def predict(ids, net):
     net.eval(); P = []
     for j, xb in batches(ids, 12, False):
-        with torch.autocast('cuda', dtype=torch.float16):
+        with torch.autocast('cuda', dtype=AMP_DTYPE):
             p  = torch.sigmoid(net(xb).float())
             p += torch.sigmoid(net(xb.flip(-1)).float())     # h-flip
             p += torch.sigmoid(net(xb.flip(2)).float())      # slice-reverse
@@ -250,7 +287,7 @@ for ep in range(CFG['epochs']):
         yb = torch.from_numpy(Y_s[j]).cuda()
         if CFG['mixup'] > 0 and ep < CFG['epochs'] - 2:
             xb, yb = mixup(xb, yb, CFG['mixup'])
-        with torch.autocast('cuda', dtype=torch.float16):
+        with torch.autocast('cuda', dtype=AMP_DTYPE):
             logits, aux = dp(xb, return_aux=True)
             lo = focal_bce(logits.float(), yb, CFG['focal'], cls_w)
             # auxiliary loss: each plane predicts all 12 targets
@@ -265,7 +302,7 @@ for ep in range(CFG['epochs']):
             sched.step(); step += 1; ema.update(model)
         tl += lo.item() * CFG['accum']; n += 1
         if n % 100 == 0:
-            print(f'  step {n} loss {tl/n:.4f} lr {opt.param_groups[0]["lr"]:.2e} {time.time()-te:.0f}s', flush=True)
+            print(f'  step {n} loss {tl/n:.4f} lr {max(g["lr"] for g in opt.param_groups):.2e} {time.time()-te:.0f}s', flush=True)
 
     # SWA
     if ep >= swa_ep:
@@ -287,13 +324,13 @@ for ep in range(CFG['epochs']):
     print('  gold/class:', np.round(a_gold, 3).tolist(), flush=True)
     if CFG['full'] or score > best:
         best = score
-        tag = f'{CFG["arch"].split(".")[0]}_f{CFG["fold"]}_s{CFG["seed"]}{"_full" if CFG["full"] else ""}'
+        tag = f'{ARCH_TAG}_f{CFG["fold"]}_s{CFG["seed"]}{"_full" if CFG["full"] else ""}'
         torch.save({k: v.half() for k, v in ema.shadow.state_dict().items()},
                    f'/kaggle/working/model_{tag}.pt')
 
 # save SWA model too
 if swa_model is not None:
-    tag = f'{CFG["arch"].split(".")[0]}_f{CFG["fold"]}_s{CFG["seed"]}_swa{"_full" if CFG["full"] else ""}'
+    tag = f'{ARCH_TAG}_f{CFG["fold"]}_s{CFG["seed"]}_swa{"_full" if CFG["full"] else ""}'
     torch.save({k: v.half() for k, v in swa_model.state_dict().items()},
                f'/kaggle/working/model_{tag}.pt')
 
