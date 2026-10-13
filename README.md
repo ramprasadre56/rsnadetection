@@ -16,6 +16,19 @@ report-derived soft labels and the radiologist gold subset, scored by mean per-l
 Save the outputs of steps 1–3 as Kaggle datasets and attach them to the next notebook. The scripts find inputs
 anywhere under `/kaggle/input/`.
 
+## Ready-to-run Kaggle notebooks
+
+`kaggle/knee_train.ipynb` and `kaggle/knee_submit.ipynb` embed the scripts, so you only upload and *Run All*:
+
+1. **Train:** go to Kaggle → *Create → New Notebook → File → Import Notebook* and pick `kaggle/knee_train.ipynb`.
+   Attach the competition data and your LLM-label dataset (plus `train_u8.npy` if you have it). Set GPU T4×2 with
+   internet on, edit `RUNS`, then *Save & Run All*.
+2. **Save the models:** from the finished version's *Output* tab, create a dataset (for example `knee-models`).
+3. **Submit:** import `kaggle/knee_submit.ipynb`, attach the competition data and `knee-models`, set internet off,
+   *Save & Run All*, then *Submit to Competition*.
+
+After editing any `knee_*.py`, regenerate the notebooks with `python kaggle/build_notebooks.py`.
+
 ## DINOv3 backbones
 
 `knee_train_v2.py` accepts any timm backbone through `ARCH`, including the self-supervised DINOv3 weights, which timm

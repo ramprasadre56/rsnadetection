@@ -21,7 +21,8 @@ L = ['ACL','MCL','Medial Meniscus','Lateral Meniscus','Medial OA','Lateral OA',
 
 def find(name):
     for pat in [f'/kaggle/input/*/{name}', f'/kaggle/input/*/*/{name}',
-                f'/kaggle/input/*/*/*/{name}', f'/kaggle/input/*/*/*/*/{name}']:
+                f'/kaggle/input/*/*/*/{name}', f'/kaggle/input/*/*/*/*/{name}',
+                f'/kaggle/working/{name}']:   # built in the same notebook by knee_prep.py
         g = glob.glob(pat)
         if g: return g[0]
     raise FileNotFoundError(name)
